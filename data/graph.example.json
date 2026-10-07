@@ -1,0 +1,11 @@
+{
+  "nodes": ["GATE", "PLAZA", "HILL", "LAKE", "TOWER"],
+  "edges": [
+    {"id": "E1", "from": "GATE",  "to": "PLAZA", "travel_seconds": 180, "has_stairs": false, "capacity": 2},
+    {"id": "E2", "from": "PLAZA", "to": "HILL",  "travel_seconds": 240, "has_stairs": true},
+    {"id": "E3", "from": "PLAZA", "to": "LAKE",  "travel_seconds": 300, "has_stairs": false, "capacity": 2},
+    {"id": "E4", "from": "HILL",  "to": "TOWER", "travel_seconds": 120, "has_stairs": true},
+    {"id": "E5", "from": "LAKE",  "to": "TOWER", "travel_seconds": 240, "has_stairs": false, "capacity": 2},
+    {"id": "E6", "from": "PLAZA", "to": "TOWER", "travel_seconds": 600, "has_stairs": true}
+  ]
+}

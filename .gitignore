@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# SQLite 本地数据
+data/*.db
+data/*.db-wal
+data/*.db-shm
+*.db-wal
+*.db-shm

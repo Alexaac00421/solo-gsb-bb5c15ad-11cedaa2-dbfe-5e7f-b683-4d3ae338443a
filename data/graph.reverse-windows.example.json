@@ -1,0 +1,15 @@
+{
+  "nodes": ["GATE", "PLAZA", "HILL", "LAKE", "TOWER"],
+  "edges": [
+    {"id": "E1", "from": "GATE",  "to": "PLAZA", "travel_seconds": 180, "has_stairs": false},
+    {"id": "E2", "from": "PLAZA", "to": "HILL",  "travel_seconds": 240, "has_stairs": true},
+    {"id": "E3", "from": "PLAZA", "to": "LAKE",  "travel_seconds": 300, "has_stairs": false},
+    {"id": "E4", "from": "HILL",  "to": "TOWER", "travel_seconds": 120, "has_stairs": true},
+    {"id": "E5", "from": "LAKE",  "to": "TOWER", "travel_seconds": 240, "has_stairs": false,
+     "reverse_windows": [
+       {"start": "2026-10-05T11:00:00Z", "end": "2026-10-05T13:00:00Z"},
+       {"start": "2026-10-05T14:00:00Z", "end": "2026-10-05T16:00:00Z"}
+     ]},
+    {"id": "E6", "from": "PLAZA", "to": "TOWER", "travel_seconds": 600, "has_stairs": true}
+  ]
+}

@@ -1,0 +1,33 @@
+services:
+  park-route:
+    build: .
+    image: park-route-planner:1.0.0
+    container_name: park-route-planner
+    ports:
+      - "8080:8080"
+    environment:
+      # 监听
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8080"
+      # SQLite 数据库文件（持久化到命名卷）
+      APP_DB_PATH: "/data/routing.db"
+      # 启动初始化：留空使用内置示例数据；指向 /data 下文件可自定义
+      APP_SEED_GRAPH: ""
+      APP_SEED_CLOSURES: ""
+      # 设为 0 可禁用内置示例（空库启动，等待导入）
+      APP_SEED_SAMPLE: "1"
+    volumes:
+      - park-route-data:/data
+      # 如需用自己的数据初始化，取消下面两行注释并把 JSON 放到 ./data 目录：
+      # - ./data/graph.json:/init/graph.json:ro
+      # - ./data/closures.json:/init/closures.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3); assert json.load(r)['status']=='ok'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  park-route-data:
