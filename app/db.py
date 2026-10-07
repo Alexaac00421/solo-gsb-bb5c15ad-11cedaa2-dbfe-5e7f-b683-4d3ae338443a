@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS trips (
     avoid_stairs  INTEGER NOT NULL CHECK (avoid_stairs IN (0, 1)),
     party_size    INTEGER NOT NULL CHECK (party_size > 0),
     status        TEXT NOT NULL CHECK (status IN ('confirmed', 'cancelled')),
+    -- 乐观修订号：确认时为 1，每次改签成功递增 1（改签请求须携带当前修订号）
+    revision_no   INTEGER NOT NULL DEFAULT 1,
     created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     cancelled_at  INTEGER
 );
@@ -166,6 +168,7 @@ class TripRecord(NamedTuple):
     avoid_stairs: bool
     party_size: int
     status: str
+    revision_no: int
     created_at: int
     cancelled_at: Optional[int]
     segments: list["TripSegmentRecord"]
@@ -256,6 +259,16 @@ def _migrate_old_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE edges ADD COLUMN capacity INTEGER "
                 "CHECK (capacity IS NULL OR capacity > 0)"
+            )
+
+    trow = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='trips'"
+    ).fetchone()
+    if trow is not None and "revision_no" not in trow["sql"]:
+        # 旧库行程没有修订号：初始修订号一律为 1
+        with transaction(conn):
+            conn.execute(
+                "ALTER TABLE trips ADD COLUMN revision_no INTEGER NOT NULL DEFAULT 1"
             )
 
 
@@ -401,6 +414,22 @@ class VersionNotFoundError(ValueError):
     """恢复目标版本不存在（恢复被拒绝，生效版本不变）。"""
 
 
+class RevisionConflictError(Exception):
+    """行程修订号已变化（并发改签/取消），或行程不再是已确认状态。
+
+    改签基于的修订号与库内当前修订号不一致，本次改签不写入任何内容，
+    原行程及其占用保持不变。
+    """
+
+    def __init__(self, trip_id: int, expected_revision: int):
+        super().__init__(
+            f"行程 {trip_id} 的修订号已变化（请求基于修订 {expected_revision}），"
+            "请重新查询当前行程后再改签"
+        )
+        self.trip_id = trip_id
+        self.expected_revision = expected_revision
+
+
 def restore_version(conn: sqlite3.Connection, target: int) -> int:
     """把历史版本 ``target`` 整体恢复为新的生效版本。
 
@@ -506,12 +535,15 @@ def active_occupancy(conn: sqlite3.Connection, generation_id: int) -> dict[str, 
 # 单路段占用查询：CROSS JOIN 固定以 trip_segments 为外侧表，
 # 经 idx_trip_seg_edge 按 (edge_id, leave_ts) 范围定位，再按行程主键
 # 回表过滤世代与状态——读取行数只取决于该路段在该时刻之后的占用量。
+# ``exclude_trip_id`` 非 NULL 时排除该行程自身的逐段占用（改签重规划
+# 先释放本行程原占用，新规划不得被自身旧路线阻挡）。
 EDGE_OCCUPANCY_SQL = (
     "SELECT ts.enter_ts AS enter_ts, ts.leave_ts AS leave_ts, "
     "       t.party_size AS party_size "
     "FROM trip_segments ts CROSS JOIN trips t ON t.trip_id = ts.trip_id "
     "WHERE ts.edge_id=? AND ts.leave_ts > ? "
     "  AND t.generation_id=? AND t.status='confirmed' "
+    "  AND (? IS NULL OR ts.trip_id <> ?) "
     "ORDER BY ts.enter_ts"
 )
 
@@ -521,6 +553,7 @@ def edge_occupancy(
     generation_id: int,
     edge_id: str,
     not_before: int = 0,
+    exclude_trip_id: Optional[int] = None,
 ) -> list[tuple[int, int, int]]:
     """某图发布世代内**指定路段**的未取消占用（行程确认按需读取）。
 
@@ -528,13 +561,16 @@ def edge_occupancy(
     仅含当前世代且 ``status='confirmed'`` 的行程在该路段上的逐段占用。
     ``leave_ts <= not_before`` 的占用按半开区间语义不可能阻挡不早于
     ``not_before`` 进入的行程（端点相接不冲突），读取时直接过滤。
+    给出 ``exclude_trip_id`` 时排除该行程自身的占用——改签重规划先把
+    本行程当作已释放，新路线不得被其旧占用阻挡或重复计入容量。
 
     查询经 ``idx_trip_seg_edge`` 索引按路段定位，只触及该路段的占用
     行：未触及路段上的行程增长不影响本查询的读取量。调用方须在写
     事务内读取，以与并发确认/取消/发布/恢复严格串行。
     """
     rows = conn.execute(
-        EDGE_OCCUPANCY_SQL, (edge_id, not_before, generation_id)
+        EDGE_OCCUPANCY_SQL,
+        (edge_id, not_before, generation_id, exclude_trip_id, exclude_trip_id),
     ).fetchall()
     return [(r["enter_ts"], r["leave_ts"], r["party_size"]) for r in rows]
 
@@ -581,6 +617,59 @@ def insert_trip(
     return trip_id
 
 
+def replace_trip(
+    conn: sqlite3.Connection,
+    trip_id: int,
+    *,
+    version_id: int,
+    generation_id: int,
+    origin: str,
+    destination: str,
+    departure_ts: int,
+    arrival_ts: int,
+    avoid_stairs: bool,
+    party_size: int,
+    expected_revision: int,
+    segments: list[tuple],
+) -> int:
+    """在当前事务内**一次性替换**某行程的全部规划内容（改签专用）。
+
+    原子更新行程行的逐段时刻、人数、数据版本与图发布世代，并删除旧
+    逐段占用、写入新逐段占用；起点 ``origin`` 与行程编号不变，修订号
+    相对 ``expected_revision`` 递增 1。行程必须仍为 ``confirmed``，
+    否则更新 0 行（已取消/已出发由调用方事先拒绝，这里仅作并发兜底）。
+
+    返回新的修订号；行程不存在/已取消或修订号已变化（并发改签、
+    并发取消）时更新 0 行并抛出 :class:`RevisionConflictError`。
+    """
+    cur = conn.execute(
+        "UPDATE trips SET version_id=?, generation_id=?, origin=?, destination=?, "
+        "    departure_ts=?, arrival_ts=?, avoid_stairs=?, party_size=? "
+        "WHERE trip_id=? AND status='confirmed' AND revision_no=?",
+        (version_id, generation_id, origin, destination, departure_ts,
+         arrival_ts, 1 if avoid_stairs else 0, party_size,
+         trip_id, expected_revision),
+    )
+    if cur.rowcount != 1:
+        raise RevisionConflictError(trip_id, expected_revision)
+    conn.execute("DELETE FROM trip_segments WHERE trip_id=?", (trip_id,))
+    conn.executemany(
+        "INSERT INTO trip_segments(trip_id, segment_idx, edge_id, from_node, to_node, "
+        "    enter_ts, leave_ts, travel_seconds, waiting_seconds, has_stairs) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (trip_id, idx, edge_id, from_node, to_node, enter_ts, leave_ts,
+             travel_seconds, waiting_seconds, 1 if has_stairs else 0)
+            for idx, (edge_id, from_node, to_node, enter_ts, leave_ts,
+                      travel_seconds, waiting_seconds, has_stairs) in enumerate(segments)
+        ],
+    )
+    conn.execute(
+        "UPDATE trips SET revision_no=revision_no+1 WHERE trip_id=?", (trip_id,)
+    )
+    return expected_revision + 1
+
+
 def get_trip(conn: sqlite3.Connection, trip_id: int) -> Optional[TripRecord]:
     """按编号查询行程（含已取消行程；不存在返回 None）。"""
     row = conn.execute("SELECT * FROM trips WHERE trip_id=?", (trip_id,)).fetchone()
@@ -608,6 +697,7 @@ def get_trip(conn: sqlite3.Connection, trip_id: int) -> Optional[TripRecord]:
         avoid_stairs=bool(row["avoid_stairs"]),
         party_size=row["party_size"],
         status=row["status"],
+        revision_no=row["revision_no"],
         created_at=row["created_at"],
         cancelled_at=row["cancelled_at"],
         segments=segments,

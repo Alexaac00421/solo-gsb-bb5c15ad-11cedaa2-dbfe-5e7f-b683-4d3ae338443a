@@ -10,11 +10,16 @@ from fastapi.responses import JSONResponse
 
 from . import config
 from .booking import (
+    DepartureInPastError,
+    TripNotFoundError,
+    TripNotModifiableError,
     VersionConflictError,
     cancel_trip_atomic,
     confirm_trip_atomic,
+    reschedule_trip_atomic,
 )
 from .db import (
+    RevisionConflictError,
     VersionNotFoundError,
     connect,
     current_version,
@@ -354,6 +359,7 @@ def _trip_to_dict(record, snap=None) -> dict:
         ],
         "data_version": record.version_id,
         "generation_id": record.generation_id,
+        "revision_no": record.revision_no,
         "created_at_epoch": record.created_at,
     }
     if record.status == "cancelled":
@@ -471,6 +477,112 @@ async def cancel_trip(trip_id: str):
         content = _trip_to_dict(record, get_snapshot(conn, record.version_id))
         content["released"] = released
         return content
+    finally:
+        conn.close()
+
+
+@app.post("/api/trips/{trip_id}/reschedule")
+async def reschedule_trip(trip_id: str, request: Request):
+    """改签已确认且尚未出发的行程：同一串行写事务内排除原占用后重新规划，
+    成功则一次性替换逐段时刻/人数/版本/世代并递增修订号，失败原行程不变。"""
+    if not trip_id.isdigit():
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_payload", "detail": "行程编号必须是正整数"},
+        )
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"error": "invalid_payload", "detail": "请求体必须是合法 JSON"}
+        )
+
+    conn = connect()
+    try:
+        init_db(conn)
+        try:
+            current_snap = get_snapshot(conn)
+            if current_snap is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "no_data", "detail": "尚未导入步道图，请先调用导入接口"},
+                )
+            from .schemas import normalize_reschedule
+
+            query = normalize_reschedule(payload, current_snap.node_set)
+        except PayloadValidationError as exc:
+            return JSONResponse(
+                status_code=400, content={"error": "invalid_payload", "detail": str(exc)}
+            )
+        # 负载内若显式携带 trip_id，必须与路径编号一致（编号本身不可改）
+        if query["trip_id"] is not None and query["trip_id"] != int(trip_id):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_payload",
+                    "detail": "请求体 trip_id 与路径行程编号不一致",
+                },
+            )
+
+        try:
+            record, snap = reschedule_trip_atomic(
+                conn,
+                int(trip_id),
+                expected_revision=query["revision"],
+                destination=query["destination"],
+                departure=query["departure"],
+                avoid_stairs=query["avoid_stairs"],
+                people=query["people"],
+                expected_version=query["expected_version"],
+            )
+        except TripNotFoundError as exc:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "trip_not_found", "detail": str(exc)},
+            )
+        except TripNotModifiableError as exc:
+            # 已取消或已出发：明确拒绝，原行程及占用均不变
+            return JSONResponse(
+                status_code=409,
+                content={"error": "trip_not_modifiable", "detail": str(exc)},
+            )
+        except RevisionConflictError as exc:
+            current = get_trip(conn, int(trip_id))
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "revision_conflict",
+                    "detail": str(exc),
+                    "expected_revision": exc.expected_revision,
+                    "current_revision": None if current is None else current.revision_no,
+                },
+            )
+        except VersionConflictError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "version_conflict",
+                    "detail": str(exc),
+                    "expected_version": exc.expected_version,
+                    "current_version": exc.current_version,
+                },
+            )
+        except DepartureInPastError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_payload", "detail": str(exc)},
+            )
+        except NoRouteError as exc:
+            # 新路线不可行：事务已回滚，原行程与原占用保持不变
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "no_route",
+                    "detail": str(exc),
+                    "data_version": current_version(conn),
+                },
+            )
+        return _trip_to_dict(record, snap)
     finally:
         conn.close()
 

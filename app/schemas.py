@@ -488,3 +488,87 @@ def normalize_booking(payload: Any, node_set: set[str]) -> dict:
         "people": people,
         "expected_version": expected_version,
     }
+
+
+def normalize_reschedule(payload: Any, node_set: set[str]) -> dict:
+    """校验一次行程改签请求负载。
+
+    期望格式::
+
+        {"trip_id": 7,                    # 也可由路径参数给出（二者一致）
+         "revision_no": 1,
+         "departure_time": "2026-10-08T09:00:00Z",
+         "destination": "TOWER",
+         "people": 3,
+         "avoid_stairs": false,
+         "data_version": 2}              # 可选：乐观并发版本
+
+    起点（origin）与行程编号在改签中保持不变：负载携带 ``origin`` 一律
+    视为非法（起点由已确认行程决定，不能修改）。规则与
+    :func:`normalize_booking` 一致（不支持 ``stops``），另要求：
+
+    - ``revision_no`` 必填，为**正整数**修订号，须与库内行程当前修订
+      号一致（旧库行程的初始修订号为 1）；
+    - ``people`` 必填，为正整数人数；
+    - 新出发时刻只做格式校验，业务上必须**晚于当前时刻**，该规则在
+      写事务内判定（时钟以服务端事务时刻为准）。
+    """
+    data = _require_object(payload, "行程改签")
+    for field in ("revision_no", "departure_time", "destination", "people"):
+        if field not in data:
+            raise ValidationError(f"缺少必填字段: {field}")
+    if "origin" in data:
+        raise ValidationError("改签不能修改起点（origin）：起点保持原行程不变")
+    if "stops" in data:
+        raise ValidationError("行程改签不支持 stops 停靠点字段")
+
+    trip_id = None
+    if "trip_id" in data and data["trip_id"] is not None:
+        trip_id = data["trip_id"]
+        if isinstance(trip_id, bool) or not isinstance(trip_id, int) or trip_id <= 0:
+            raise ValidationError("trip_id 必须是正整数")
+
+    revision = data["revision_no"]
+    if isinstance(revision, bool) or not isinstance(revision, int):
+        raise ValidationError("revision_no 必须是正整数")
+    if revision <= 0:
+        raise ValidationError(f"revision_no 必须为正整数，收到 {revision}")
+
+    destination = _clean_identifier(data.get("destination"), "destination")
+    if destination not in node_set:
+        raise ValidationError(f"destination 引用了未知节点: {destination!r}")
+
+    try:
+        departure = parse_time(data["departure_time"])
+    except TimeError as exc:
+        raise ValidationError(f"departure_time: {exc}") from None
+
+    avoid_stairs = data.get("avoid_stairs", False)
+    if not isinstance(avoid_stairs, bool):
+        raise ValidationError("avoid_stairs 必须是布尔值 true/false")
+
+    people = data["people"]
+    if isinstance(people, bool) or not isinstance(people, int):
+        raise ValidationError("people 必须是正整数")
+    if people <= 0:
+        raise ValidationError(f"people 必须为正整数，收到 {people}")
+
+    expected_version = None
+    if "data_version" in data and data["data_version"] is not None:
+        expected_version = data["data_version"]
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int):
+            raise ValidationError("data_version 必须是正整数版本号")
+        if expected_version <= 0:
+            raise ValidationError(
+                f"data_version 必须是正整数版本号，收到 {expected_version}"
+            )
+
+    return {
+        "trip_id": trip_id,
+        "revision": revision,
+        "destination": destination,
+        "departure": departure,
+        "avoid_stairs": avoid_stairs,
+        "people": people,
+        "expected_version": expected_version,
+    }

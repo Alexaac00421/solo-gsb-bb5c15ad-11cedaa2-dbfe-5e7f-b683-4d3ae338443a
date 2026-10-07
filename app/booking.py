@@ -37,7 +37,7 @@ import time
 from typing import Optional
 
 from . import db
-from .db import Snapshot, TripRecord, transaction
+from .db import RevisionConflictError, Snapshot, TripRecord, transaction
 from .routing import NoRouteError, Route, build_engine
 
 
@@ -70,10 +70,18 @@ class DemandOccupancy:
     ``edges_read``/``rows_read`` 为读取统计，供性能验证与测试断言。
     """
 
-    def __init__(self, conn: sqlite3.Connection, generation_id: int, not_before: int = 0):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        generation_id: int,
+        not_before: int = 0,
+        exclude_trip_id: Optional[int] = None,
+    ):
         self._conn = conn
         self._generation_id = generation_id
         self._not_before = not_before
+        # 改签重规划时给出：本行程原占用先被视为已释放，不阻挡新路线
+        self._exclude_trip_id = exclude_trip_id
         self._cache: dict[str, list[tuple[int, int, int]]] = {}
         self.edges_read: list[str] = []
         self.rows_read: int = 0
@@ -82,7 +90,11 @@ class DemandOccupancy:
         cached = self._cache.get(edge_id)
         if cached is None:
             cached = db.edge_occupancy(
-                self._conn, self._generation_id, edge_id, self._not_before
+                self._conn,
+                self._generation_id,
+                edge_id,
+                self._not_before,
+                self._exclude_trip_id,
             )
             self._cache[edge_id] = cached
             self.edges_read.append(edge_id)
@@ -184,3 +196,117 @@ def cancel_trip_atomic(conn: sqlite3.Connection, trip_id: int) -> Optional[tuple
             record = db.get_trip(conn, trip_id)
             return record, False
         return db.get_trip(conn, trip_id), True
+
+
+class TripNotFoundError(Exception):
+    """改签目标行程不存在。"""
+
+
+class TripNotModifiableError(Exception):
+    """行程已取消或已出发，不能改签（原行程与占用均不变）。"""
+
+    def __init__(self, trip_id: int, reason: str):
+        super().__init__(f"行程 {trip_id} 无法改签：{reason}")
+        self.trip_id = trip_id
+        self.reason = reason
+
+
+class DepartureInPastError(Exception):
+    """新出发时刻不晚于当前时刻。"""
+
+
+def reschedule_trip(
+    conn: sqlite3.Connection,
+    trip_id: int,
+    *,
+    expected_revision: int,
+    destination: str,
+    departure: int,
+    avoid_stairs: bool,
+    people: int,
+    expected_version: Optional[int] = None,
+    now: Optional[int] = None,
+) -> tuple[TripRecord, Snapshot]:
+    """在串行写事务内为已确认且**尚未出发**的行程改签。
+
+    必须在外层写事务中调用（本函数内部不再加事务），与行程确认、取消、
+    步道图发布、封闭更新及版本恢复严格串行，容量绝不超额。
+
+    流程：
+    1. 固定当前数据版本与图发布世代（``data_version`` 不符抛
+       :class:`VersionConflictError`）；
+    2. 校验行程存在、仍为 ``confirmed``、尚未出发、修订号一致；
+    3. 新出发时刻必须严格晚于当前时刻（``now`` 缺省取系统时钟）；
+    4. **先排除本行程原占用**，在当前版本/世代下按既有封闭、反向窗、
+       半开容量规则重新规划（起点不变，终点/出发时刻/人数/避台阶可改）；
+    5. 成功后一次性替换逐段时刻、人数、数据版本与世代，修订号递增 1。
+
+    任何失败都由调用方回滚：原行程及其容量占用保持不变。
+    """
+    current_ts = int(time.time()) if now is None else now
+    if departure <= current_ts:
+        raise DepartureInPastError(
+            "新出发时刻必须晚于当前时刻"
+            f"（当前 {current_ts}，请求出发 {departure}）"
+        )
+
+    snap = db.get_snapshot(conn)
+    if snap is None:
+        raise NoRouteError("尚未导入步道图，无法改签行程")
+    if expected_version is not None and expected_version != snap.version_id:
+        raise VersionConflictError(expected_version, snap.version_id)
+
+    record = db.get_trip(conn, trip_id)
+    if record is None:
+        raise TripNotFoundError(f"行程 {trip_id} 不存在")
+    if record.status == "cancelled":
+        raise TripNotModifiableError(trip_id, "行程已取消")
+    # 尚未出发：按行程的计划出发时刻（半开，恰在当前时刻出发即已出发）
+    if record.departure_ts <= current_ts:
+        raise TripNotModifiableError(trip_id, "行程已出发")
+    if record.revision_no != expected_revision:
+        raise RevisionConflictError(trip_id, expected_revision)
+    # 起点保持不变：起点在当前版本图中必须仍然存在，否则新路线不可行
+    if record.origin not in snap.node_set:
+        raise NoRouteError(
+            f"行程起点 {record.origin!r} 在当前步道图中已不存在，无法改签"
+        )
+
+    # 按需占用视图：排除本行程自身的旧占用（改签先视为释放原路线），
+    # 其余同世代未取消行程照常计量；与写入同属当前串行写事务。
+    occupancy = DemandOccupancy(
+        conn,
+        snap.generation_id,
+        not_before=departure,
+        exclude_trip_id=trip_id,
+    )
+    engine = build_engine(snap, occupancy)
+    route = engine.plan(
+        origin=record.origin,
+        destination=destination,
+        departure=departure,
+        avoid_stairs=avoid_stairs,
+        party_size=people,
+    )
+
+    db.replace_trip(
+        conn,
+        trip_id,
+        version_id=snap.version_id,
+        generation_id=snap.generation_id,
+        origin=record.origin,
+        destination=destination,
+        departure_ts=departure,
+        arrival_ts=route.arrival_time,
+        avoid_stairs=avoid_stairs,
+        party_size=people,
+        expected_revision=expected_revision,
+        segments=_segments_to_rows(route),
+    )
+    return db.get_trip(conn, trip_id), snap
+
+
+def reschedule_trip_atomic(conn: sqlite3.Connection, trip_id: int, **kwargs) -> tuple[TripRecord, Snapshot]:
+    """打开立即写事务后执行 :func:`reschedule_trip`；失败整体回滚。"""
+    with transaction(conn):
+        return reschedule_trip(conn, trip_id, **kwargs)

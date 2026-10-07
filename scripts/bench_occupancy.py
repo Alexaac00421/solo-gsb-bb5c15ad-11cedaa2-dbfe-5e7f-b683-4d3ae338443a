@@ -57,8 +57,8 @@ def measure(k: int) -> None:
         reads = {"rows": 0, "edges": set()}
         real = db.edge_occupancy
 
-        def spy(conn_, generation_id, edge_id, not_before=0):
-            rows = real(conn_, generation_id, edge_id, not_before)
+        def spy(conn_, generation_id, edge_id, not_before=0, exclude_trip_id=None):
+            rows = real(conn_, generation_id, edge_id, not_before, exclude_trip_id)
             reads["rows"] += len(rows)
             reads["edges"].add(edge_id)
             return rows

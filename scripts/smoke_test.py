@@ -486,6 +486,101 @@ def main() -> int:
     assert old_cancel["released"] is True, old_cancel
     print("重新发布：新世代独立计量，旧行程仍可查询和取消 ✔")
 
+    # 21. 行程改签（reschedule）：新世代刚开启，占用为空。
+    #     确认一单 2 人未来行程，再改签终点/时刻/人数/避台阶。
+    rb = {
+        "origin": "P", "destination": "R",
+        "departure_time": "2099-07-01T08:00:00Z",
+        "avoid_stairs": False, "people": 2,
+    }
+    status, r1 = call("POST", "/api/trips", rb, expect_status=201)
+    rid = r1["trip_id"]
+    assert r1["revision_no"] == 1, r1
+
+    # 成功改签：起点/编号不变，修订号 1 -> 2，逐段时刻与人数整体替换
+    status, rr = call("POST", f"/api/trips/{rid}/reschedule", {
+        "revision_no": 1,
+        "departure_time": "2099-07-02T09:00:00Z",
+        "destination": "Q", "people": 1, "avoid_stairs": False,
+    })
+    assert status == 200, rr
+    assert rr["trip_id"] == rid and rr["origin"] == "P", rr
+    assert rr["destination"] == "Q" and rr["people"] == 1, rr
+    assert rr["query_departure_time"] == "2099-07-02T09:00:00Z", rr
+    assert [s["edge_id"] for s in rr["segments"]] == ["C1"], rr
+    assert rr["segments"][0]["enter_time"] == "2099-07-02T09:00:00Z", rr
+    assert rr["revision_no"] == 2, rr
+    print("改签成功：起点/编号不变，修订号递增，逐段时刻/人数一次性替换")
+
+    # 旧修订号重试 → 409 revision_conflict，原行程不变
+    status, rconf = call("POST", f"/api/trips/{rid}/reschedule", {
+        "revision_no": 1,
+        "departure_time": "2099-07-03T09:00:00Z",
+        "destination": "R", "people": 1}, expect_status=409)
+    assert rconf["error"] == "revision_conflict", rconf
+    assert rconf["current_revision"] == 2, rconf
+
+    # data_version 不符 → 409 version_conflict
+    status, rvconf = call("POST", f"/api/trips/{rid}/reschedule", {
+        "revision_no": 2, "data_version": 999,
+        "departure_time": "2099-07-03T09:00:00Z",
+        "destination": "R", "people": 1}, expect_status=409)
+    assert rvconf["error"] == "version_conflict", rvconf
+
+    # 新出发时刻不晚于当前时刻 → 400 invalid_payload
+    status, rpast = call("POST", f"/api/trips/{rid}/reschedule", {
+        "revision_no": 2,
+        "departure_time": "2000-01-01T00:00:00Z",
+        "destination": "R", "people": 1}, expect_status=400)
+    assert rpast["error"] == "invalid_payload", rpast
+
+    # 参数非法：改起点、人数非正、修订号非正整数、缺字段
+    for bad in (
+        {"revision_no": 2, "departure_time": "2099-07-03T09:00:00Z",
+         "destination": "R", "people": 1, "origin": "Q"},
+        {"revision_no": 2, "departure_time": "2099-07-03T09:00:00Z",
+         "destination": "R", "people": 0},
+        {"revision_no": "1", "departure_time": "2099-07-03T09:00:00Z",
+         "destination": "R", "people": 1},
+        {"revision_no": 2, "destination": "R", "people": 1},
+    ):
+        status, bx = call("POST", f"/api/trips/{rid}/reschedule", bad,
+                          expect_status=400)
+        assert bx["error"] == "invalid_payload", bx
+
+    # 不可行新路线（3 人 > C1 容量 2，唯一路径）→ 404，原行程不变
+    status, rfull = call("POST", f"/api/trips/{rid}/reschedule", {
+        "revision_no": 2,
+        "departure_time": "2099-07-03T09:00:00Z",
+        "destination": "R", "people": 3}, expect_status=404)
+    assert rfull["error"] == "no_route", rfull
+    status, rgot = call("GET", f"/api/trips/{rid}")
+    assert rgot["revision_no"] == 2 and rgot["destination"] == "Q", rgot
+
+    # 改签自身旧占用不阻挡新路线（改到另一时刻立即进入，不排队）
+    status, rr2 = call("POST", f"/api/trips/{rid}/reschedule", {
+        "revision_no": 2,
+        "departure_time": "2099-08-01T08:00:00Z",
+        "destination": "R", "people": 2})
+    assert rr2["revision_no"] == 3, rr2
+    assert rr2["segments"][0]["enter_time"] == "2099-08-01T08:00:00Z", rr2
+
+    # 取消后不能改签 → 409 trip_not_modifiable
+    call("POST", f"/api/trips/{rid}/cancel")
+    status, rcancel = call("POST", f"/api/trips/{rid}/reschedule", {
+        "revision_no": 3,
+        "departure_time": "2099-09-01T08:00:00Z",
+        "destination": "R", "people": 1}, expect_status=409)
+    assert rcancel["error"] == "trip_not_modifiable", rcancel
+    # 不存在的行程 → 404 trip_not_found
+    status, rmiss = call("POST", "/api/trips/999999/reschedule", {
+        "revision_no": 1,
+        "departure_time": "2099-09-01T08:00:00Z",
+        "destination": "R", "people": 1}, expect_status=404)
+    assert rmiss["error"] == "trip_not_found", rmiss
+    print("改签拒绝路径：修订号/版本冲突、过去时刻、非法参数、"
+          "不可行路线、已取消、不存在 ✔")
+
     # 普通路线查询语义不变：容量字段不出现在 /api/route 响应
     status, plain = call("POST", "/api/route", {
         "origin": "P", "destination": "R",

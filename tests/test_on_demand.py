@@ -65,8 +65,8 @@ class OnDemandTestBase(unittest.TestCase):
         calls = {"rows": 0, "edges": []}
         real = db.edge_occupancy
 
-        def spy(conn, generation_id, edge_id, not_before=0):
-            rows = real(conn, generation_id, edge_id, not_before)
+        def spy(conn, generation_id, edge_id, not_before=0, exclude_trip_id=None):
+            rows = real(conn, generation_id, edge_id, not_before, exclude_trip_id)
             calls["rows"] += len(rows)
             calls["edges"].append(edge_id)
             return rows
@@ -259,7 +259,7 @@ class QueryPlanTests(OnDemandTestBase):
             self.confirm(origin="X", destination="Y", departure=0,
                          avoid_stairs=False, people=1)
         plan = self.conn.execute(
-            "EXPLAIN QUERY PLAN " + EDGE_OCCUPANCY_SQL, ("E1", 0, 1)
+            "EXPLAIN QUERY PLAN " + EDGE_OCCUPANCY_SQL, ("E1", 0, 1, None, None)
         ).fetchall()
         detail = " | ".join(r["detail"] for r in plan)
         # 按 (edge_id, leave_ts) 索引范围定位 + 行程主键回表，无整表扫描
