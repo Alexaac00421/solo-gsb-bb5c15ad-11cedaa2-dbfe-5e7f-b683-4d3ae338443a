@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS trips (
     avoid_stairs  INTEGER NOT NULL CHECK (avoid_stairs IN (0, 1)),
     party_size    INTEGER NOT NULL CHECK (party_size > 0),
     status        TEXT NOT NULL CHECK (status IN ('confirmed', 'cancelled')),
+    -- 行程修订号：确认时为 1，每次成功改签递增 1（乐观并发控制）
+    revision      INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
     created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     cancelled_at  INTEGER
 );
@@ -169,6 +171,7 @@ class TripRecord(NamedTuple):
     created_at: int
     cancelled_at: Optional[int]
     segments: list["TripSegmentRecord"]
+    revision: int = 1
 
 
 class TripSegmentRecord(NamedTuple):
@@ -256,6 +259,17 @@ def _migrate_old_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE edges ADD COLUMN capacity INTEGER "
                 "CHECK (capacity IS NULL OR capacity > 0)"
+            )
+
+    # 行程修订号：改签能力新增列；旧库行程初始修订号为 1。
+    trow = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='trips'"
+    ).fetchone()
+    if trow is not None and "revision" not in trow["sql"]:
+        with transaction(conn):
+            conn.execute(
+                "ALTER TABLE trips ADD COLUMN revision INTEGER NOT NULL "
+                "DEFAULT 1 CHECK (revision > 0)"
             )
 
 
@@ -515,12 +529,26 @@ EDGE_OCCUPANCY_SQL = (
     "ORDER BY ts.enter_ts"
 )
 
+# 改签专用变体：在上述条件上额外排除本行程原占用（一次性替换语义：
+# 重新规划只与其余行程竞争容量，不能与自身旧占用互相阻挡）。
+EDGE_OCCUPANCY_EXCLUDE_SQL = (
+    "SELECT ts.enter_ts AS enter_ts, ts.leave_ts AS leave_ts, "
+    "       t.party_size AS party_size "
+    "FROM trip_segments ts CROSS JOIN trips t ON t.trip_id = ts.trip_id "
+    "WHERE ts.edge_id=? AND ts.leave_ts > ? "
+    "  AND t.generation_id=? AND t.status='confirmed' "
+    "  AND t.trip_id != ? "
+    "ORDER BY ts.enter_ts"
+)
+
 
 def edge_occupancy(
     conn: sqlite3.Connection,
     generation_id: int,
     edge_id: str,
     not_before: int = 0,
+    *,
+    exclude_trip_id: Optional[int] = None,
 ) -> list[tuple[int, int, int]]:
     """某图发布世代内**指定路段**的未取消占用（行程确认按需读取）。
 
@@ -528,14 +556,23 @@ def edge_occupancy(
     仅含当前世代且 ``status='confirmed'`` 的行程在该路段上的逐段占用。
     ``leave_ts <= not_before`` 的占用按半开区间语义不可能阻挡不早于
     ``not_before`` 进入的行程（端点相接不冲突），读取时直接过滤。
+    给出 ``exclude_trip_id`` 时（改签）排除该行程自身的原占用——改签
+    在同一事务内“先释放原占用、再确认新路线”，新规划不得与自身旧
+    占用竞争。
 
     查询经 ``idx_trip_seg_edge`` 索引按路段定位，只触及该路段的占用
     行：未触及路段上的行程增长不影响本查询的读取量。调用方须在写
     事务内读取，以与并发确认/取消/发布/恢复严格串行。
     """
-    rows = conn.execute(
-        EDGE_OCCUPANCY_SQL, (edge_id, not_before, generation_id)
-    ).fetchall()
+    if exclude_trip_id is None:
+        rows = conn.execute(
+            EDGE_OCCUPANCY_SQL, (edge_id, not_before, generation_id)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            EDGE_OCCUPANCY_EXCLUDE_SQL,
+            (edge_id, not_before, generation_id, exclude_trip_id),
+        ).fetchall()
     return [(r["enter_ts"], r["leave_ts"], r["party_size"]) for r in rows]
 
 
@@ -611,7 +648,54 @@ def get_trip(conn: sqlite3.Connection, trip_id: int) -> Optional[TripRecord]:
         created_at=row["created_at"],
         cancelled_at=row["cancelled_at"],
         segments=segments,
+        revision=int(row["revision"]) if "revision" in row.keys() else 1,
     )
+
+
+def replace_trip(
+    conn: sqlite3.Connection,
+    trip_id: int,
+    *,
+    version_id: int,
+    generation_id: int,
+    destination: str,
+    departure_ts: int,
+    arrival_ts: int,
+    avoid_stairs: bool,
+    party_size: int,
+    segments: list[tuple],
+) -> int:
+    """在当前事务内**一次性替换**行程的逐段时刻、人数、数据版本与世代。
+
+    改签专用：行程编号、起点与创建时间保持不变；旧逐段占用全部删除，
+    写入重新规划得到的新逐段占用，行程修订号 ``revision`` 递增 1。
+    必须在外层写事务中调用（占用读取、规划与替换须与并发确认/取消/
+    发布严格串行）。返回新的修订号。
+    """
+    conn.execute(
+        "UPDATE trips SET version_id=?, generation_id=?, destination=?, "
+        "    departure_ts=?, arrival_ts=?, avoid_stairs=?, party_size=?, "
+        "    revision=revision+1 "
+        "WHERE trip_id=? AND status='confirmed'",
+        (version_id, generation_id, destination, departure_ts, arrival_ts,
+         1 if avoid_stairs else 0, party_size, trip_id),
+    )
+    conn.execute("DELETE FROM trip_segments WHERE trip_id=?", (trip_id,))
+    conn.executemany(
+        "INSERT INTO trip_segments(trip_id, segment_idx, edge_id, from_node, to_node, "
+        "    enter_ts, leave_ts, travel_seconds, waiting_seconds, has_stairs) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (trip_id, idx, edge_id, from_node, to_node, enter_ts, leave_ts,
+             travel_seconds, waiting_seconds, 1 if has_stairs else 0)
+            for idx, (edge_id, from_node, to_node, enter_ts, leave_ts,
+                      travel_seconds, waiting_seconds, has_stairs) in enumerate(segments)
+        ],
+    )
+    row = conn.execute(
+        "SELECT revision FROM trips WHERE trip_id=?", (trip_id,)
+    ).fetchone()
+    return int(row["revision"])
 
 
 def cancel_trip(conn: sqlite3.Connection, trip_id: int, cancelled_at: int) -> bool:

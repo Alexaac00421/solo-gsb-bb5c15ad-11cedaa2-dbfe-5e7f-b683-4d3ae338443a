@@ -8,9 +8,11 @@
 支持在查询中指定**按顺序停靠的站点**（每站带开始停留时间窗与停留秒数），
 见第 4.1 节；也支持为**多名访客**在候选节点中选择公共汇合点，见第 4.2 节。
 高峰时段可通过**容量确认**接口为正整数人数的访客团原子锁定有容量保障的行程
-（不足时在节点等待、并发不超额、可按编号查询与取消），见第 4.5 节。确认
-寻路**按需读取**实际触及的有容量路段占用，未触及路段上的行程增长不会使
-单次确认的读取量线性增长，验证方式见第 5.1 节。
+（不足时在节点等待、并发不超额、可按编号查询与取消），见第 4.5 节；已确认且
+**尚未出发**的行程还可通过**改签**接口在当前数据版本与图发布世代下重新规划
+（编号与起点不变、修订号递增、旧库行程初始修订号为 1、原占用先排除再确认），
+见第 4.6 节。确认寻路**按需读取**实际触及的有容量路段占用，未触及路段上的
+行程增长不会使单次确认的读取量线性增长，验证方式见第 5.1 节。
 导入前可用**联合预检**接口一次性校验候选步道图与封闭记录（含反向通行窗与
 容量字段），返回全部可判定错误且不改动当前数据，见第 4.3 节。误发布后可用
 **版本恢复**把任一历史版本的节点、路段、封闭记录与反向通行窗整体恢复为新的
@@ -601,6 +603,77 @@ curl -X POST http://localhost:8080/admin/restore \
 
 容量释放后，后续同时间窗的确认可立即使用相应容量（见第 5 节示例）。
 
+### 4.6 行程改签（`POST /api/trips/{trip_id}/rebook`）
+
+访客团需要调整一条**已确认且尚未出发**的行程时，按编号发起改签：系统在当前
+数据版本与图发布世代下重新规划，**先排除本行程原占用**，再按既有封闭、反向
+通行窗与半开容量规则确认新路线；成功后在同一个串行写事务内**一次性替换**
+逐段时刻、人数、数据版本与世代，行程**修订号**（`revision`）递增 1。
+
+- **编号与起点不变**：行程编号沿用路径参数，起点取原行程；负载中携带
+  `origin` 字段视为非法（改签不可变更起点）。可以变更的是新出发时刻、终点、
+  人数与避台阶选项；
+- **修订号（乐观并发）**：行程确认时 `revision=1`，每次成功改签 +1。请求必须
+  携带与行程当前值一致的 `revision`，否则拒绝（`409 revision_conflict`），
+  避免两人同时基于同一份旧行程改签而互相覆盖。**旧库迁移上来的行程初始修订号
+  同样为 1**；
+- **新出发时刻必须严格晚于当前时刻**（按写事务时刻判定）；且原行程必须
+  **尚未出发**（当前时刻严格早于原出发时刻）；
+- `data_version` 可选：携带时必须与服务端当前版本一致，否则
+  `409 version_conflict`（与确认接口同一乐观版本语义）；不传则总是按当前
+  版本规划；
+- 改签与确认、取消、图发布、版本恢复、封闭更新共用同一 `BEGIN IMMEDIATE`
+  写事务队列，串行提交，容量绝不超额；规划失败或任何拒绝都整体回滚，**原
+  行程及其容量占用均不变**。
+
+请求（路径参数为行程编号）：
+
+```json
+{
+  "departure_time": "2026-10-05T12:00:00Z",
+  "destination": "TOWER",
+  "people": 3,
+  "avoid_stairs": false,
+  "revision": 1,
+  "data_version": 2
+}
+```
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `departure_time` | 是 | 新出发时刻（ISO 8601 或纪元秒），必须晚于当前时刻 |
+| `destination` | 是 | 新终点（必须是当前版本的已知节点；起点不可变更） |
+| `people` | 是 | 新人数，**正整数**（严格类型，拒绝布尔/浮点/字符串） |
+| `avoid_stairs` | 否 | 是否避台阶（布尔，默认 `false`） |
+| `revision` | 是 | 行程当前修订号（正整数；确认后为 1，每次改签递增） |
+| `data_version` | 否 | 乐观版本号（正整数）；与当前版本不一致则 `409` |
+
+响应 `200`：**更新后的完整行程**，结构与 `GET /api/trips/{id}` 完全一致
+（含逐段时刻、每段 `capacity`、`data_version`、`generation_id`），其中
+`revision` 已递增、`trip_id`/`origin` 不变。行程查询响应（4.5 节）自本轮起
+也附带 `revision` 字段（新增字段，其余字段与行为保持兼容）。
+
+错误：
+
+| 场景 | 状态码 | `error` |
+| --- | --- | --- |
+| 编号非正整数、字段缺失/非法（未知终点、人数或修订号非正整数、携带 `origin`/`stops`、时间格式错误等） | `400` | `invalid_payload` |
+| 新出发时刻不晚于当前时刻 | `400` | `invalid_payload` |
+| 行程编号不存在 | `404` | `trip_not_found` |
+| 新路线在封闭/反向窗/容量约束下不可行（含人数超过沿途容量）；**原行程与占用不变** | `404` | `no_route` |
+| 行程已取消 | `409` | `trip_cancelled` |
+| 行程已出发（当前时刻不早于原出发时刻） | `409` | `trip_departed` |
+| `revision` 与行程当前修订号不符 | `409` | `revision_conflict` |
+| 携带的 `data_version` 与当前版本不符 | `409` | `version_conflict` |
+| 尚未导入步道图 | `503` | `no_data` |
+
+- `revision_conflict` 响应体给出 `expected_revision` 与 `current_revision`；
+  `trip_departed` 给出原出发时刻与当前时刻（ISO 与纪元秒）；调用方据此按
+  最新行程重试；
+- 起点即终点的零段行程同样可以改签（新终点即起点时仍为零段）；
+- 改签不改变行程状态（保持 `confirmed`），也不改变 `trip_id`；改签后的行程
+  仍可继续查询、再次改签与取消（取消幂等规则不变）。
+
 ### `POST /admin/graph` — 原子发布新步道图
 
 ```bash
@@ -834,6 +907,45 @@ curl -s -X POST http://localhost:8080/api/trips/1/cancel
 # 当前版本与图发布世代
 curl -s http://localhost:8080/version
 # -> {"data_version":2,"generation_id":1,"nodes":5,"edges":6,...}
+
+# --- 改签：已确认且尚未出发的行程可整体改约（编号/起点不变，修订号递增）---
+# 先确认一条未来出发的行程（revision=1）
+curl -s -X POST http://localhost:8080/api/trips \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"GATE","destination":"TOWER",
+       "departure_time":"2026-12-31T09:00:00Z","people":2}'
+# -> 201 {"trip_id":8,"revision":1,...}
+
+# 改签到更晚时刻、改终点为 LAKE、改人数为 1、避台阶
+curl -s -X POST http://localhost:8080/api/trips/8/rebook \
+  -H 'Content-Type: application/json' \
+  -d '{"departure_time":"2026-12-31T12:30:00Z",
+       "destination":"LAKE","people":1,"avoid_stairs":true,
+       "revision":1}'
+# -> 200 完整行程：trip_id=8、origin=GATE 不变，逐段/人数/终点已替换，
+#         data_version/generation_id 为当前值，revision=2
+
+# 用旧修订号再次改签 -> 409 revision_conflict，原行程不变
+curl -s -X POST http://localhost:8080/api/trips/8/rebook \
+  -H 'Content-Type: application/json' \
+  -d '{"departure_time":"2026-12-31T15:00:00Z","destination":"TOWER",
+       "people":1,"revision":1}'
+# -> 409 {"error":"revision_conflict",
+#         "expected_revision":1,"current_revision":2}
+
+# 携带当前修订号 + 当前 data_version 改签成功（revision 2 -> 3）
+curl -s -X POST http://localhost:8080/api/trips/8/rebook \
+  -H 'Content-Type: application/json' \
+  -d '{"departure_time":"2026-12-31T15:00:00Z","destination":"TOWER",
+       "people":1,"revision":2,"data_version":2}'
+
+# 新出发时刻已在过去 -> 400 invalid_payload
+curl -s -X POST http://localhost:8080/api/trips/8/rebook \
+  -H 'Content-Type: application/json' \
+  -d '{"departure_time":"2000-01-01T00:00:00Z","destination":"TOWER",
+       "people":1,"revision":3}'
+# 已出发行程改签 -> 409 trip_departed；已取消 -> 409 trip_cancelled；
+# 编号不存在 -> 404 trip_not_found；新路线不可行 -> 404 no_route（均不改动原行程）
 ```
 
 ```python
@@ -866,6 +978,42 @@ elif status == 409:
     status, trip = book(payload)
 elif status == 404:
     print("无可行行程（容量/封闭/窗约束），未产生任何占用")
+```
+
+改签 Python 示例：
+
+```python
+import json, urllib.error, urllib.request
+
+def call(method, url, payload=None):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Content-Type": "application/json"}, method=method,
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.load(resp)
+    except urllib.error.HTTPError as e:
+        return e.code, json.load(e)
+
+# 携带当前修订号改签；冲突时取响应中的 current_revision 后按最新行程重试
+status, trip = call("POST", "http://localhost:8080/api/trips/8/rebook", {
+    "departure_time": "2026-12-31T12:30:00Z",
+    "destination": "LAKE",
+    "people": 1,
+    "avoid_stairs": True,
+    "revision": 1,                 # GET 行程时拿到的当前修订号
+})
+if status == 200:
+    print("改签成功：新修订号", trip["revision"], "到达", trip["arrival_time"])
+elif status == 409 and trip["error"] == "revision_conflict":
+    print("行程已被他人改动，请按修订号", trip["current_revision"], "重试")
+elif status == 409 and trip["error"] == "version_conflict":
+    print("数据版本已变化：", trip["current_version"])
+elif status == 409 and trip["error"] == "trip_departed":
+    print("行程已出发，不能改签")
+elif status == 404 and trip["error"] == "no_route":
+    print("新路线不可行，原行程及占用均未改变")
 ```
 
 多人汇合点示例：
@@ -1057,7 +1205,7 @@ K=2000   触及路段=['E1'] 按需读取=2 行 | 旧版预加载=2003 行 | 本
   `edge_id -> [(enter, leave, people)]` 的惰性视图，只有寻路实际触及的
   **有容量**路段才触发一次按路段查询（`db.edge_occupancy` 经
   `idx_trip_seg_edge(edge_id, leave_ts)` 索引定位，并过滤
-  `leave_ts <= 出发时刻` 的占用——半开区间端点相接本就不可能阻挡），
+  `leave_ts` 不晚于出发时刻 的占用——半开区间端点相接本就不可能阻挡），
   结果按路段缓存，每条路段在一次确认内至多读取一次；未触及路段上的
   行程增长不会使单次确认的读取量线性增长（基准见 5.1 节）。所有占用
   读取与行程写入同属该串行写事务，占用视图固定（版本与世代在事务
@@ -1071,6 +1219,18 @@ K=2000   触及路段=['E1'] 按需读取=2 行 | 旧版预加载=2003 行 | 本
   确认看到的占用互不重叠，绝不超额；规划失败或版本冲突时事务回滚，
   不留下任何占用。普通 `/api/route` 与 `/api/meeting` 不提供占用，
   引擎容量约束完全不参与，返回结构与语义保持不变。
+- **行程改签**（`POST /api/trips/{id}/rebook`）：改签与确认、取消、图
+  发布、版本恢复、封闭更新共用同一 `BEGIN IMMEDIATE` 写事务队列，按
+  提交顺序串行生效。事务内先校验“新出发时刻晚于事务时刻、行程存在且
+  仍为已确认、尚未出发、修订号一致、可选 data_version 一致”，再在
+  **当前**版本与世代下重新规划；按需占用视图额外带
+  `exclude_trip_id`，在 SQL 内排除本行程原占用（重新规划只与其余行程
+  竞争容量，不与自身旧占用互相阻挡）。成功后由 `db.replace_trip`
+  一次性替换逐段占用、人数、终点、数据版本与世代，并令
+  `revision=revision+1`；行程编号、起点与创建时间不变。任一拒绝都在
+  提交前抛出并整体回滚，原行程与占用均不变。旧库 `trips` 表缺少
+  `revision` 列时由 `init_db` 以 `ALTER TABLE ADD COLUMN ... DEFAULT 1`
+  原地补列，旧行程初始修订号为 1。
 - **图发布世代与容量计量**：每次步道图发布与版本恢复开启新世代
   （世代号即新版本号），封闭记录更新沿用当前世代。行程行同时记录
   `version_id`（规划所用数据版本）与 `generation_id`（容量计量口径）；
@@ -1079,12 +1239,13 @@ K=2000   触及路段=['E1'] 按需读取=2 行 | 旧版预加载=2003 行 | 本
   其所属世代）。旧库首次启动自动迁移：`versions` 重建并按发布语义
   回填世代（图发布/恢复各自开世代，封闭更新沿用上一世代），
   `edges` 以 `ALTER TABLE` 增加可空 `capacity` 列（既有版本容量不限），
-  `trip_segments` 以 `CREATE INDEX IF NOT EXISTS` 补建
+  `trips` 以 `ALTER TABLE ... DEFAULT 1` 增加 `revision` 列（旧行程初始
+  修订号为 1），`trip_segments` 以 `CREATE INDEX IF NOT EXISTS` 补建
   `idx_trip_seg_edge(edge_id, leave_ts)` 索引（按需读取按路段定位）。
 - **原子发布与版本一致**：
   - 每次导入（图或封闭）在一个 SQLite 写事务中完成全部校验、复制与版本指针切换，
-    失败整体回滚；行程确认/取消使用同一 `BEGIN IMMEDIATE` 写事务队列，与导入、
-    恢复及彼此之间严格串行提交，保证并发确认不超额、不会读到半个版本；
+    失败整体回滚；行程确认/改签/取消使用同一 `BEGIN IMMEDIATE` 写事务队列，与导入、
+    恢复及彼此之间严格串行提交，保证并发确认与改签不超额、不会读到半个版本；
   - 每次查询在开始时读取一次 `current_version` 并固定，**整次请求只用同一版本**，
     导入进行中或刚完成都不会看到半个版本；
   - 历史版本在库中保留，可按版本号追溯。
@@ -1105,16 +1266,16 @@ app/
   timeutil.py      # ISO 8601 <-> 纪元秒（UTC）
   schemas.py       # 导入/查询负载校验（含停靠点 stops、多人汇合 meeting、反向窗、容量、行程确认）
   precheck.py      # 联合预检：候选图+封闭记录只读批量校验（收集全部错误及位置）
-  db.py            # SQLite 版本化、图发布世代、原子发布与行程持久化（含按路段占用查询）
+  db.py            # SQLite 版本化、图发布世代、原子发布与行程持久化（含按路段占用查询、改签替换与修订号迁移）
   routing.py       # 时间依赖最短路 + 字典序选路引擎（含停靠、汇合、反向窗、容量占用）
-  booking.py       # 容量确认/取消：串行写事务、按需占用视图、世代计量、版本冲突
-  main.py          # FastAPI 路由
+  booking.py       # 容量确认/改签/取消：串行写事务、按需占用视图（改签排除自身旧占用）、世代计量、版本/修订号冲突
+  main.py          # FastAPI 路由（含改签 POST /api/trips/{id}/rebook）
   sample_data.py   # 内置示例数据
   cli.py           # init-db / import-* / restore / serve
 data/              # 示例 JSON 与本地数据库
 scripts/smoke_test.py
 scripts/bench_occupancy.py  # 容量确认按需读取占用的性能基准（见 5.1 节）
-tests/             # 标准库 unittest 测试（194 个用例）
+tests/             # 标准库 unittest 测试（220 个用例）
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh
@@ -1144,6 +1305,12 @@ python3 -m unittest discover -s tests -v
 原子确认/查询/取消幂等不重复释放、并发确认不超额、封闭更新同世代
 继续计量、重新发布与版本恢复开新世代且旧行程可查可取消、
 旧库世代回填与容量列迁移、版本冲突不写入、普通路线查询语义不变）、
+行程改签（一次性替换逐段/人数/终点/版本/世代且编号起点不变、
+修订号初始为 1 并逐次递增、先排除本行程原占用再确认、仍与其他行程
+竞争不超额、不可行时原行程与占用不变、不存在/已取消/已出发/修订号/
+data_version 不符分别拒绝、新出发时刻必须晚于事务时刻、起点与
+stops 字段非法、零段行程改签、封闭更新同世代与图重发/恢复新世代下
+改签、并发改签与确认混合不超额、旧库 revision 列自动迁移与负载校验）、
 按需读取占用（未触及路段的行程增长不使单次确认读量线性增长、
 触及路段至多读取一次、按需视图与全量预加载规划结果一致、
 不晚于出发时刻即结束的占用读取时过滤、占用查询走索引无整表扫描、

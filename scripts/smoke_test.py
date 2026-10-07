@@ -493,6 +493,125 @@ def main() -> int:
     assert plain["edge_sequence"] == ["C1", "C2"], plain
     assert "capacity" not in plain["segments"][0], plain
 
+    # 21. 行程改签（POST /api/trips/{id}/rebook）：新出发时刻取运行时
+    #     的未来时间，避免硬编码时刻随日期变成“已出发”。
+    import datetime as _dt
+
+    def iso_at(hour: int, minute: int = 0, day_offset: int = 365):
+        t = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=day_offset))
+        return t.replace(hour=hour, minute=minute, second=0,
+                         microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    t_book = iso_at(8, 0)
+    t_rbk = iso_at(12, 30)
+    t_rbk2 = iso_at(15, 0)
+    print(f"改签检查：确认 {t_book} 出发，改签至 {t_rbk} / {t_rbk2}")
+
+    status, rb0 = call("POST", "/api/trips", {
+        "origin": "P", "destination": "R",
+        "departure_time": t_book, "avoid_stairs": False, "people": 2,
+    }, expect_status=201)
+    rid = rb0["trip_id"]
+    assert rb0["revision"] == 1, rb0
+
+    # 改签：换终点/人数/出发时刻，起点与编号不变，修订号 1 -> 2
+    status, r1 = call("POST", f"/api/trips/{rid}/rebook", {
+        "departure_time": t_rbk, "destination": "Q",
+        "people": 1, "avoid_stairs": False, "revision": 1,
+    }, expect_status=200)
+    assert r1["trip_id"] == rid and r1["origin"] == "P", r1
+    assert r1["destination"] == "Q" and r1["people"] == 1, r1
+    assert r1["query_departure_time"] == t_rbk, r1
+    assert [s["edge_id"] for s in r1["segments"]] == ["C1"], r1
+    assert r1["revision"] == 2, r1
+    # GET 返回与改签后的新行程一致并带修订号
+    status, got_r = call("GET", f"/api/trips/{rid}")
+    assert got_r["destination"] == "Q" and got_r["revision"] == 2, got_r
+    print("改签成功：编号/起点不变，逐段时刻/人数/终点一次性替换，revision=2")
+
+    # 用旧修订号再改签 -> 409 revision_conflict
+    status, rbad_rev = call("POST", f"/api/trips/{rid}/rebook", {
+        "departure_time": t_rbk2, "destination": "R",
+        "people": 1, "revision": 1}, expect_status=409)
+    assert rbad_rev["error"] == "revision_conflict", rbad_rev
+    assert (rbad_rev["expected_revision"], rbad_rev["current_revision"]) == (1, 2)
+
+    # 携带当前修订号成功改签；携带过期 data_version -> 409
+    cur_ver = call("GET", "/version")[1]["data_version"]
+    status, rbad_ver = call("POST", f"/api/trips/{rid}/rebook", {
+        "departure_time": t_rbk2, "destination": "R",
+        "people": 1, "revision": 2, "data_version": cur_ver - 1 or 1},
+        expect_status=409)
+    assert rbad_ver["error"] == "version_conflict", rbad_ver
+    status, r2 = call("POST", f"/api/trips/{rid}/rebook", {
+        "departure_time": t_rbk2, "destination": "R",
+        "people": 1, "avoid_stairs": False,
+        "revision": 2, "data_version": cur_ver}, expect_status=200)
+    assert r2["revision"] == 3 and r2["destination"] == "R", r2
+    assert [s["edge_id"] for s in r2["segments"]] == ["C1", "C2"], r2
+    print("修订号/版本乐观并发：旧值 409，当前值放行，revision=3")
+
+    # 参数非法：缺字段、人数非正整数、修订号非正整数、变更起点、加停靠点
+    for bad in (
+        {"departure_time": t_rbk, "people": 1, "revision": 3},
+        {"departure_time": t_rbk, "destination": "R", "people": 0, "revision": 3},
+        {"departure_time": t_rbk, "destination": "R", "people": 1, "revision": "3"},
+        {"departure_time": t_rbk, "destination": "R", "people": 1,
+         "revision": 3, "origin": "Q"},
+        {"departure_time": t_rbk, "destination": "R", "people": 1,
+         "revision": 3, "stops": []},
+    ):
+        status, bx = call("POST", f"/api/trips/{rid}/rebook", bad,
+                          expect_status=400)
+        assert bx["error"] == "invalid_payload", bx
+
+    # 新出发时刻不在未来 -> 400 invalid_payload（原行程不变）
+    status, past = call("POST", f"/api/trips/{rid}/rebook", {
+        "departure_time": "2000-01-01T00:00:00Z", "destination": "Q",
+        "people": 1, "revision": 3}, expect_status=400)
+    assert past["error"] == "invalid_payload", past
+    status, got_unchanged = call("GET", f"/api/trips/{rid}")
+    assert got_unchanged["revision"] == 3 and got_unchanged["destination"] == "R"
+    print("非法参数/过去时刻 -> 400，原行程及占用不变")
+
+    # 取消后改签 -> 409 trip_cancelled
+    call("POST", f"/api/trips/{rid}/cancel")
+    status, rcancel = call("POST", f"/api/trips/{rid}/rebook", {
+        "departure_time": iso_at(18, 0), "destination": "Q",
+        "people": 1, "revision": 3}, expect_status=409)
+    assert rcancel["error"] == "trip_cancelled", rcancel
+
+    # 不存在行程 -> 404 trip_not_found
+    status, rmissing = call("POST", "/api/trips/999999/rebook", {
+        "departure_time": iso_at(18, 0), "destination": "Q",
+        "people": 1, "revision": 1}, expect_status=404)
+    assert rmissing["error"] == "trip_not_found", rmissing
+
+    # 编号非正整数 -> 400
+    status, rbadid = call("POST", "/api/trips/xyz/rebook", {
+        "departure_time": iso_at(18, 0), "destination": "Q",
+        "people": 1, "revision": 1}, expect_status=400)
+    assert rbadid["error"] == "invalid_payload", rbadid
+
+    # 改签排除自身旧占用：两人团占满 C1/C2 后改签，仍可在新时刻落位，
+    # 不受自己旧占用阻挡；同时与其他行程竞争容量。
+    status, k1 = call("POST", "/api/trips", {
+        "origin": "P", "destination": "R",
+        "departure_time": iso_at(9, 0), "people": 2}, expect_status=201)
+    status, k2 = call("POST", f"/api/trips/{k1['trip_id']}/rebook", {
+        "departure_time": iso_at(9, 0), "destination": "R",
+        "people": 2, "revision": 1}, expect_status=200)
+    assert k2["segments"][0]["enter_time"] == iso_at(9, 0), k2
+    # 另一行程同刻占满容量 -> 改签必须排队等待（不超额）
+    status, blocker = call("POST", "/api/trips", {
+        "origin": "P", "destination": "R",
+        "departure_time": iso_at(10, 0), "people": 2}, expect_status=201)
+    status, k3 = call("POST", f"/api/trips/{k2['trip_id']}/rebook", {
+        "departure_time": iso_at(10, 0), "destination": "R",
+        "people": 2, "revision": 2}, expect_status=200)
+    assert k3["segments"][0]["enter_time"] == iso_at(10, 2), k3
+    print("改签容量：排除自身旧占用、与其他行程排队，绝不超额 ✔")
+
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
         return 1

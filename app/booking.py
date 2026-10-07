@@ -53,6 +53,45 @@ class VersionConflictError(Exception):
         self.current_version = current
 
 
+class TripNotFoundError(LookupError):
+    """改签目标行程不存在（行程及占用均不变）。"""
+
+
+class TripCancelledError(Exception):
+    """改签目标行程已取消，不能改签（占用此前已释放，本次不做任何改动）。"""
+
+
+class TripDepartedError(Exception):
+    """行程已经出发（当前时刻不早于其出发时刻），不能改签。"""
+
+    def __init__(self, trip_id: int, departure_ts: int, now: int):
+        super().__init__(
+            f"行程 {trip_id} 已出发（出发时刻 {departure_ts}，当前时刻 {now}），"
+            "不能改签"
+        )
+        self.departure_ts = departure_ts
+        self.now = now
+
+
+class RevisionConflictError(Exception):
+    """请求携带的修订号与行程当前修订号不符，未写入任何内容。"""
+
+    def __init__(self, expected_revision: int, current_revision: int):
+        super().__init__(
+            f"行程修订号已变化：请求携带 {expected_revision}，当前为 "
+            f"{current_revision}，请按最新行程重新改签"
+        )
+        self.expected_revision = expected_revision
+        self.current_revision = current_revision
+
+
+class RebookValidationError(ValueError):
+    """改签参数在写事务时刻判定非法（如新出发时刻未晚于当前时刻）。
+
+    原行程及占用均不变；HTTP 层映射为 ``400 invalid_payload``。
+    """
+
+
 class DemandOccupancy:
     """当前图发布世代占用的**按需视图**（容量确认规划专用）。
 
@@ -67,13 +106,24 @@ class DemandOccupancy:
     （``leave_ts <= not_before``）按半开区间语义不可能阻挡本行程，
     读取时直接过滤，进一步缩小读取范围。
 
+    ``exclude_trip_id``（改签时使用）在 SQL 内排除本行程的原占用：
+    改签在同一事务内一次性替换逐段占用，重新规划只与**其余**行程
+    竞争容量，不能与自身旧占用互相阻挡。
+
     ``edges_read``/``rows_read`` 为读取统计，供性能验证与测试断言。
     """
 
-    def __init__(self, conn: sqlite3.Connection, generation_id: int, not_before: int = 0):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        generation_id: int,
+        not_before: int = 0,
+        exclude_trip_id: Optional[int] = None,
+    ):
         self._conn = conn
         self._generation_id = generation_id
         self._not_before = not_before
+        self._exclude_trip_id = exclude_trip_id
         self._cache: dict[str, list[tuple[int, int, int]]] = {}
         self.edges_read: list[str] = []
         self.rows_read: int = 0
@@ -81,9 +131,18 @@ class DemandOccupancy:
     def __call__(self, edge_id: str) -> list[tuple[int, int, int]]:
         cached = self._cache.get(edge_id)
         if cached is None:
-            cached = db.edge_occupancy(
-                self._conn, self._generation_id, edge_id, self._not_before
-            )
+            if self._exclude_trip_id is None:
+                cached = db.edge_occupancy(
+                    self._conn, self._generation_id, edge_id, self._not_before
+                )
+            else:
+                cached = db.edge_occupancy(
+                    self._conn,
+                    self._generation_id,
+                    edge_id,
+                    self._not_before,
+                    exclude_trip_id=self._exclude_trip_id,
+                )
             self._cache[edge_id] = cached
             self.edges_read.append(edge_id)
             self.rows_read += len(cached)
@@ -165,6 +224,107 @@ def confirm_trip_atomic(conn: sqlite3.Connection, **kwargs) -> tuple[TripRecord,
     """打开立即写事务后执行 :func:`confirm_trip`；失败整体回滚。"""
     with transaction(conn):
         return confirm_trip(conn, **kwargs)
+
+
+def rebook_trip(
+    conn: sqlite3.Connection,
+    trip_id: int,
+    *,
+    expected_revision: int,
+    departure: int,
+    destination: str,
+    avoid_stairs: bool,
+    people: int,
+    expected_version: Optional[int] = None,
+    now: Optional[int] = None,
+) -> tuple[TripRecord, Snapshot]:
+    """在当前写事务内为一条已确认且**尚未出发**的行程改签。
+
+    起点与行程编号保持不变，按调用方给出的新出发时刻、终点、人数与
+    避台阶选项，在**当前数据版本与图发布世代**下重新规划：
+
+    1. 固定当前版本与世代（与确认/取消/发布/恢复/封闭更新严格串行）；
+    2. 校验新出发时刻严格晚于当前时刻，以及行程存在、仍为已确认、
+       尚未出发（``now`` 早于其原出发时刻）、修订号一致，和可选
+       ``data_version`` 与当前版本一致；
+    3. 占用视图在 SQL 内**排除本行程原占用**后按既有封闭、反向窗与
+       半开容量规则重新确认新路线；
+    4. 成功后一次性替换逐段时刻、人数、数据版本与世代，修订号递增。
+
+    任何拒绝（新出发时刻不在未来、行程不存在/已取消/已出发、修订号
+    或版本不符、新路线不可行）均不写入任何内容，原行程及其容量占用
+    保持不变（调用方回滚事务）。
+
+    成功返回 ``(更新后的行程记录, 规划使用的版本快照)``。
+    """
+    current_time = int(time.time()) if now is None else now
+
+    # 写事务内固定当前版本与世代：与所有其他写入严格串行
+    snap = db.get_snapshot(conn)
+    if snap is None:
+        raise NoRouteError("尚未导入步道图，无法改签行程")
+
+    # 新出发时刻必须严格晚于事务时刻（与“尚未出发”共用同一墙钟，
+    # 避免事务前后取时不一致造成边界判定歧义）
+    if departure <= current_time:
+        raise RebookValidationError(
+            f"新出发时刻必须晚于当前时刻（当前 {current_time}，收到 {departure}）"
+        )
+
+    record = db.get_trip(conn, trip_id)
+    if record is None:
+        raise TripNotFoundError(f"行程 {trip_id} 不存在")
+    if record.status == "cancelled":
+        raise TripCancelledError(f"行程 {trip_id} 已取消，不能改签")
+    # 尚未出发：当前时刻必须严格早于行程的（请求时）出发时刻
+    if current_time >= record.departure_ts:
+        raise TripDepartedError(trip_id, record.departure_ts, current_time)
+    if expected_revision != record.revision:
+        raise RevisionConflictError(expected_revision, record.revision)
+    if expected_version is not None and expected_version != snap.version_id:
+        raise VersionConflictError(expected_version, snap.version_id)
+
+    # 起点保持不变；按当前版本/世代重新规划，占用视图排除本行程原占用
+    occupancy = DemandOccupancy(
+        conn,
+        snap.generation_id,
+        not_before=departure,
+        exclude_trip_id=trip_id,
+    )
+    engine = build_engine(snap, occupancy)
+    route = engine.plan(
+        origin=record.origin,
+        destination=destination,
+        departure=departure,
+        avoid_stairs=avoid_stairs,
+        party_size=people,
+    )
+
+    new_revision = db.replace_trip(
+        conn,
+        trip_id,
+        version_id=snap.version_id,
+        generation_id=snap.generation_id,
+        destination=destination,
+        departure_ts=departure,
+        arrival_ts=route.arrival_time,
+        avoid_stairs=avoid_stairs,
+        party_size=people,
+        segments=_segments_to_rows(route),
+    )
+    updated = db.get_trip(conn, trip_id)
+    assert updated is not None and updated.revision == new_revision
+    return updated, snap
+
+
+def rebook_trip_atomic(conn: sqlite3.Connection, trip_id: int, **kwargs) -> tuple[TripRecord, Snapshot]:
+    """打开立即写事务后执行 :func:`rebook_trip`；失败整体回滚。
+
+    改签与确认、取消、图发布、版本恢复及封闭更新共用同一
+    ``BEGIN IMMEDIATE`` 写事务队列，按提交顺序串行生效，容量绝不超额。
+    """
+    with transaction(conn):
+        return rebook_trip(conn, trip_id, **kwargs)
 
 
 def cancel_trip_atomic(conn: sqlite3.Connection, trip_id: int) -> Optional[tuple[TripRecord, bool]]:
